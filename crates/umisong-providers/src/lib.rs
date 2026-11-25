@@ -2,6 +2,7 @@ pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod discovery;
+pub mod installer;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -12,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use umisong_core::{
     AgentEvent, ApprovalDecision, AuthLoginMode, ModelOption, PermissionMode, ProviderId,
-    ProviderSettings, ProviderStatus, ThinkingLevel,
+    ProviderInstallState, ProviderSettings, ProviderStatus, ThinkingLevel,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -79,6 +80,13 @@ pub trait ProviderAdapter: Send + Sync {
     /// Live-discover models / plan / account for the signed-in user (may be slow).
     async fn discover_live_info(&self, _settings: &ProviderSettings) -> Option<LiveProviderInfo> {
         None
+    }
+
+    async fn install_cli(
+        &self,
+        on_progress: &(dyn Fn(ProviderInstallState) + Send + Sync),
+    ) -> Result<PathBuf> {
+        crate::installer::install_provider_cli(self.id(), on_progress).await
     }
 
     async fn run_turn(

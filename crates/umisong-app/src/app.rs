@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use umisong_core::{
     AgentEvent, AppSettings, AuthLoginMode, CompareIsolationMode, CompareRun, DaemonNotification,
     DaemonRequest, DaemonResponse, DiffScope, GitDiffSnapshot, PermissionMode, PlanTier,
-    ProviderId, ProviderStatus, SessionDetail, SessionSummary, ThinkingLevel, ToolCallRecord,
-    TurnExitReason, TurnRecord, TurnStatus, UnifiedModelGroup, Workspace,
+    ProviderId, ProviderInstallState, ProviderStatus, SessionDetail, SessionSummary, ThinkingLevel,
+    ToolCallRecord, TurnExitReason, TurnRecord, TurnStatus, UnifiedModelGroup, Workspace,
     build_unified_model_catalog, find_unified_entry, strongest_available_model,
 };
 
@@ -68,6 +68,7 @@ pub struct UmisongApp {
 
     pub active_view: ActiveView,
     pub providers: HashMap<ProviderId, ProviderStatus>,
+    pub provider_install_states: HashMap<ProviderId, ProviderInstallState>,
     pub provider_drafts: HashMap<ProviderId, ProviderDraft>,
     pub accounts_advanced_open: HashMap<ProviderId, bool>,
 
@@ -111,6 +112,9 @@ pub struct UmisongApp {
 
     pub toast: Option<(String, bool)>,
     pending_first_prompt: Option<String>,
+    settings_loaded: bool,
+    providers_loaded: bool,
+    startup_auto_install_checked: bool,
 }
 
 impl UmisongApp {
@@ -139,6 +143,7 @@ impl UmisongApp {
             last_applied_dark: Some(true),
             active_view: ActiveView::Chat,
             providers: HashMap::new(),
+            provider_install_states: HashMap::new(),
             provider_drafts: HashMap::new(),
             accounts_advanced_open: HashMap::new(),
             workspaces: Vec::new(),
@@ -175,6 +180,9 @@ impl UmisongApp {
             handoff_modal: None,
             toast: None,
             pending_first_prompt: None,
+            settings_loaded: false,
+            providers_loaded: false,
+            startup_auto_install_checked: false,
         };
 
         if let Some(mode) = preview_mode {
@@ -644,6 +652,44 @@ impl UmisongApp {
             .send(RequestTag::RefreshProviders, DaemonRequest::ListProviders);
     }
 
+    pub fn install_provider_cli(&mut self, provider: ProviderId) {
+        self.provider_install_states.insert(
+            provider,
+            ProviderInstallState::Installing {
+                method: "starting".into(),
+                detail: format!("Installing {} CLI…", provider.display_name()),
+            },
+        );
+        self.client.send(
+            RequestTag::InstallProviders,
+            DaemonRequest::InstallProvider { provider },
+        );
+    }
+
+    pub fn install_missing_providers(&mut self) {
+        self.client.send(
+            RequestTag::InstallProviders,
+            DaemonRequest::InstallMissingProviders,
+        );
+    }
+
+    fn maybe_trigger_startup_auto_install(&mut self) {
+        if self.startup_auto_install_checked || !self.settings_loaded || !self.providers_loaded {
+            return;
+        }
+        self.startup_auto_install_checked = true;
+        if !self.settings.auto_install_clis {
+            return;
+        }
+        let any_missing = self
+            .providers
+            .values()
+            .any(|st| !st.installed && st.settings.binary_override.is_none());
+        if any_missing {
+            self.install_missing_providers();
+        }
+    }
+
     pub fn save_app_settings(&mut self) {
         self.client.send(
             RequestTag::SaveSettings,
@@ -837,14 +883,18 @@ impl UmisongApp {
                     }
                 }
                 self.settings = s;
+                self.settings_loaded = true;
                 self.sync_selected_model_from_catalog();
+                self.maybe_trigger_startup_auto_install();
             }
             DaemonResponse::Providers(list) => {
                 for st in list {
                     self.sync_provider_draft(&st);
                     self.providers.insert(st.provider, st);
                 }
+                self.providers_loaded = true;
                 self.sync_selected_model_from_catalog();
+                self.maybe_trigger_startup_auto_install();
             }
             DaemonResponse::Provider(st) => {
                 self.sync_provider_draft(&st);
@@ -853,6 +903,16 @@ impl UmisongApp {
                 self.sync_selected_model_from_catalog();
                 if matches!(tag, RequestTag::SaveProviderConfig) {
                     self.toast = Some((format!("Saved {} settings.", pid.display_name()), false));
+                }
+            }
+            DaemonResponse::InstallStarted { providers } => {
+                for pid in providers {
+                    self.provider_install_states.entry(pid).or_insert_with(|| {
+                        ProviderInstallState::Installing {
+                            method: "auto".into(),
+                            detail: format!("Installing {} CLI…", pid.display_name()),
+                        }
+                    });
                 }
             }
             DaemonResponse::AuthTerminalStarted {
@@ -1064,6 +1124,15 @@ impl UmisongApp {
                 self.sync_provider_draft(&st);
                 self.providers.insert(st.provider, st);
                 self.sync_selected_model_from_catalog();
+            }
+            DaemonNotification::ProviderInstallUpdated { provider, state } => {
+                if matches!(state, ProviderInstallState::Installed) {
+                    self.toast = Some((
+                        format!("Installed {} CLI — ready to sign in.", provider.display_name()),
+                        false,
+                    ));
+                }
+                self.provider_install_states.insert(provider, state);
             }
             DaemonNotification::TurnEvent {
                 session_id,
@@ -1418,6 +1487,34 @@ impl UmisongApp {
                     paint_status_dot(ui, conn_col, true);
                     ui.label(RichText::new(conn_label).size(11.5).color(palette.text_muted));
 
+                    let installing_names: Vec<&'static str> = ProviderId::ALL
+                        .iter()
+                        .copied()
+                        .filter(|pid| {
+                            matches!(
+                                self.provider_install_states.get(pid),
+                                Some(ProviderInstallState::Installing { .. })
+                            )
+                        })
+                        .map(|pid| pid.display_name())
+                        .collect();
+                    if !installing_names.is_empty() {
+                        ui.separator();
+                        ui.add(egui::Spinner::new().size(11.0));
+                        let label = format!("Installing CLIs: {}…", installing_names.join(", "));
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(label).size(11.5).color(palette.accent),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            self.active_view = ActiveView::Accounts;
+                        }
+                    }
+
                     if let Some((msg, is_err)) = self.toast.clone() {
                         ui.separator();
                         let col = if is_err {
@@ -1692,6 +1789,7 @@ mod tests {
             last_applied_dark: Some(true),
             active_view: ActiveView::Chat,
             providers: HashMap::new(),
+            provider_install_states: HashMap::new(),
             provider_drafts: HashMap::new(),
             accounts_advanced_open: HashMap::new(),
             workspaces: Vec::new(),
@@ -1728,6 +1826,9 @@ mod tests {
             handoff_modal: None,
             toast: None,
             pending_first_prompt: None,
+            settings_loaded: false,
+            providers_loaded: false,
+            startup_auto_install_checked: false,
         }
     }
 
@@ -1755,6 +1856,49 @@ mod tests {
             notes: None,
         };
         app.providers.insert(ProviderId::Antigravity, agy);
+        app.providers.insert(
+            ProviderId::ClaudeCode,
+            ProviderStatus {
+                provider: ProviderId::ClaudeCode,
+                installed: false,
+                binary_path: None,
+                version: None,
+                auth: umisong_core::AuthState::NotInstalled,
+                effective_plan_tier: PlanTier::AutoDetect,
+                models: Vec::new(),
+                active_default_model: String::new(),
+                settings: umisong_core::ProviderSettings::default_for(ProviderId::ClaudeCode),
+                notes: None,
+            },
+        );
+        app.provider_install_states.insert(
+            ProviderId::ClaudeCode,
+            ProviderInstallState::Installing {
+                method: "official installer".into(),
+                detail: "Installing Claude Code via official installer…".into(),
+            },
+        );
+        app.providers.insert(
+            ProviderId::Codex,
+            ProviderStatus {
+                provider: ProviderId::Codex,
+                installed: false,
+                binary_path: None,
+                version: None,
+                auth: umisong_core::AuthState::NotInstalled,
+                effective_plan_tier: PlanTier::AutoDetect,
+                models: Vec::new(),
+                active_default_model: String::new(),
+                settings: umisong_core::ProviderSettings::default_for(ProviderId::Codex),
+                notes: None,
+            },
+        );
+        app.provider_install_states.insert(
+            ProviderId::Codex,
+            ProviderInstallState::Failed {
+                message: "network timeout".into(),
+            },
+        );
         app.sync_selected_model_from_catalog();
         app.sessions.push(SessionSummary {
             id: "sess-1".into(),

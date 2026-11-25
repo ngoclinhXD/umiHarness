@@ -16,7 +16,7 @@ Sign in with whichever account(s) you already have — Claude Pro/Max/Team/Enter
 
 ## Features
 
-- **Accounts & Plan Entitlements**: Live CLI discovery, auth & plan-tier detection (`Claude Pro/Max/Team`, `Google AI Pro/Ultra/ADC`, `ChatGPT Plus/Pro/Team`), embedded PTY Login Terminal with one-click OAuth URL opening, custom binary/model overrides, and plan-tier verification.
+- **Accounts & Plan Entitlements**: Automatic CLI detection & background installation on startup, auth & plan-tier detection (`Claude Pro/Max/Team`, `Google AI Pro/Ultra/ADC`, `ChatGPT Plus/Pro/Team`), embedded PTY Login Terminal with one-click OAuth URL opening, custom binary/model overrides, and plan-tier verification.
 - **Unified Model Menu & Thinking Levels**:
   - **Logged-In-Only Visibility**: Models from unauthenticated accounts are hidden.
   - **Family-Grouped & Strength-Ranked**: Organized under `---- Claude ------`, `---- Gemini ------`, and `---- Codex -------` sorted by strength descending, with plan-locked higher-tier models clearly marked `(Unavailable)` (e.g., `Gemini 4 Carbon` on Google AI Pro vs unlocked on Google AI Ultra).
@@ -43,10 +43,12 @@ cargo test --workspace
 
 ## Installing Provider CLIs
 
-Install any combination of the official CLIs you want to use:
+Umisong Harness automatically checks for the official **Claude Code** (`claude`), **Antigravity** (`agy`), and **OpenAI Codex** (`codex`) CLIs on open and installs any missing CLIs in the background (you can toggle **Auto-install CLIs** or trigger/retry installs per provider in the **Accounts** tab `⌘4`).
 
-- **Claude Code**: `npm install -g @anthropic-ai/claude-code`
-- **Antigravity**: See https://antigravity.google/docs/cli/reference
-- **OpenAI Codex**: `npm install -g @openai/codex`
+If you are offline or prefer to install manually:
 
-Then open the **Accounts** tab (`⌘4`) in Umisong Harness and click **Sign In** on any installed provider.
+- **Claude Code**: `curl -fsSL https://claude.ai/install.sh | bash` (or `npm install -g @anthropic-ai/claude-code`)
+- **Antigravity**: `curl -fsSL https://antigravity.google/cli/install.sh | bash` (or `brew install --cask antigravity-cli`, see https://antigravity.google/docs/cli/reference)
+- **OpenAI Codex**: `curl -fsSL https://chatgpt.com/codex/install.sh | sh` (or `npm install -g @openai/codex`)
+
+Then open the **Accounts** tab (`⌘4`) in Umisong Harness and click **Sign in** on any installed provider.

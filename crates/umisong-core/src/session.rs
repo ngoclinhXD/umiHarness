@@ -183,6 +183,8 @@ pub struct CompareRun {
 pub struct AppSettings {
     #[serde(default = "default_true")]
     pub dark_theme: bool,
+    #[serde(default = "default_true")]
+    pub auto_install_clis: bool,
     #[serde(default)]
     pub last_canonical_model: Option<String>,
     #[serde(default)]
@@ -199,6 +201,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             dark_theme: true,
+            auto_install_clis: true,
             last_canonical_model: None,
             last_thinking_level: None,
             per_model_thinking: HashMap::new(),

@@ -11,6 +11,7 @@ use umisong_daemon::DaemonConfig;
 pub enum RequestTag {
     Bootstrap,
     RefreshProviders,
+    InstallProviders,
     SaveSettings,
     SaveProviderConfig,
     StartAuth,
@@ -170,6 +171,7 @@ impl DaemonClient {
                                     ..
                                 } | DaemonNotification::CompareColumnFinished { .. }
                                     | DaemonNotification::ProviderStatusUpdated(_)
+                                    | DaemonNotification::ProviderInstallUpdated { .. }
                             );
                             let _ = inbound_tx.send(InboundMessage::Notification(n));
                             let now = std::time::Instant::now();

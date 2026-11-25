@@ -1,7 +1,7 @@
 use crate::{
     AgentEvent, AppSettings, AuthLoginMode, CompareIsolationMode, CompareRun, CompareTarget,
-    DiffScope, FileDiff, GitDiffSnapshot, PermissionMode, PlanTier, ProviderId, ProviderStatus,
-    SessionDetail, SessionSummary, ThinkingLevel, Workspace,
+    DiffScope, FileDiff, GitDiffSnapshot, PermissionMode, PlanTier, ProviderId,
+    ProviderInstallState, ProviderStatus, SessionDetail, SessionSummary, ThinkingLevel, Workspace,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +33,10 @@ pub enum DaemonRequest {
     RefreshProviderStatus {
         provider: ProviderId,
     },
+    InstallProvider {
+        provider: ProviderId,
+    },
+    InstallMissingProviders,
     UpdateProviderConfig {
         provider: ProviderId,
         binary_override: Option<String>,
@@ -161,6 +165,7 @@ pub enum DaemonResponse {
     Settings(AppSettings),
     Providers(Vec<ProviderStatus>),
     Provider(ProviderStatus),
+    InstallStarted { providers: Vec<ProviderId> },
     AuthTerminalStarted { auth_session_id: String, command: String },
     Workspaces(Vec<Workspace>),
     Workspace(Workspace),
@@ -182,6 +187,10 @@ pub enum DaemonResponse {
 #[serde(tag = "notification", content = "data", rename_all = "snake_case")]
 pub enum DaemonNotification {
     ProviderStatusUpdated(ProviderStatus),
+    ProviderInstallUpdated {
+        provider: ProviderId,
+        state: ProviderInstallState,
+    },
     TurnEvent {
         session_id: String,
         turn_id: String,
@@ -280,6 +289,19 @@ mod tests {
                 id: 6,
                 result: Ok(DaemonResponse::Settings(AppSettings::default())),
             },
+            ServerMessage::Response {
+                id: 7,
+                result: Ok(DaemonResponse::InstallStarted {
+                    providers: vec![ProviderId::ClaudeCode, ProviderId::Codex],
+                }),
+            },
+            ServerMessage::Notification(DaemonNotification::ProviderInstallUpdated {
+                provider: ProviderId::ClaudeCode,
+                state: ProviderInstallState::Installing {
+                    method: "official installer".into(),
+                    detail: "Installing Claude Code via official installer…".into(),
+                },
+            }),
             ServerMessage::Notification(DaemonNotification::WorkspaceDiffChanged {
                 workspace_path: "/tmp".into(),
             }),

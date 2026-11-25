@@ -14,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 use umisong_core::{
     AgentEvent, ApprovalDecision, CompareColumnState, CompareIsolationMode, CompareRun,
     DaemonNotification, DaemonRequest, DaemonResponse, PermissionMode, ProviderId,
-    ProviderSettings, ProviderStatus, RpcEnvelope, ServerMessage, ThinkingLevel, ToolCallRecord,
-    TurnExitReason, TurnRecord, TurnStatus,
+    ProviderInstallState, ProviderSettings, ProviderStatus, RpcEnvelope, ServerMessage,
+    ThinkingLevel, ToolCallRecord, TurnExitReason, TurnRecord, TurnStatus,
 };
 use umisong_providers::{ProviderProbeCache, ProviderRegistry, TurnExecutionRequest};
 use uuid::Uuid;
@@ -30,6 +30,8 @@ pub struct DaemonState {
     pub active_compares: Mutex<HashMap<String, CancellationToken>>,
     pub approval_senders: Mutex<HashMap<String, mpsc::UnboundedSender<ApprovalDecision>>>,
     pub model_discovery_inflight: Mutex<HashSet<ProviderId>>,
+    pub install_inflight: Mutex<HashSet<ProviderId>>,
+    pub install_states: Mutex<HashMap<ProviderId, ProviderInstallState>>,
 }
 
 impl DaemonState {
@@ -50,6 +52,8 @@ impl DaemonState {
             active_compares: Mutex::new(HashMap::new()),
             approval_senders: Mutex::new(HashMap::new()),
             model_discovery_inflight: Mutex::new(HashSet::new()),
+            install_inflight: Mutex::new(HashSet::new()),
+            install_states: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -117,6 +121,80 @@ impl DaemonState {
             self.probe_provider(ProviderId::Codex),
         );
         Ok(vec![c?, a?, x?])
+    }
+
+    pub fn set_and_broadcast_install_state(
+        &self,
+        provider: ProviderId,
+        state: ProviderInstallState,
+    ) {
+        self.install_states
+            .lock()
+            .unwrap()
+            .insert(provider, state.clone());
+        let _ = self
+            .events_tx
+            .send(DaemonNotification::ProviderInstallUpdated { provider, state });
+    }
+
+    pub fn spawn_background_install(self: &Arc<Self>, provider: ProviderId) {
+        if !self.install_inflight.lock().unwrap().insert(provider) {
+            if let Some(existing) = self.install_states.lock().unwrap().get(&provider).cloned() {
+                let _ = self
+                    .events_tx
+                    .send(DaemonNotification::ProviderInstallUpdated {
+                        provider,
+                        state: existing,
+                    });
+            }
+            return;
+        }
+
+        self.set_and_broadcast_install_state(
+            provider,
+            ProviderInstallState::Installing {
+                method: "auto".into(),
+                detail: format!("Installing {} CLI…", provider.display_name()),
+            },
+        );
+
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            let adapter = state.registry.adapter(provider);
+            let progress_state = Arc::clone(&state);
+            let res = adapter
+                .install_cli(&move |progress| {
+                    progress_state.set_and_broadcast_install_state(provider, progress);
+                })
+                .await;
+
+            match res {
+                Ok(_) => {
+                    state.set_and_broadcast_install_state(
+                        provider,
+                        ProviderInstallState::Installed,
+                    );
+                    if let Ok(st) = state.probe_provider(provider).await {
+                        if st.installed && st.auth.is_ready() {
+                            state.spawn_background_live_discovery(provider);
+                        }
+                        let _ = state
+                            .events_tx
+                            .send(DaemonNotification::ProviderStatusUpdated(st));
+                    }
+                }
+                Err(err) => {
+                    state.set_and_broadcast_install_state(
+                        provider,
+                        ProviderInstallState::Failed {
+                            message: err.to_string(),
+                        },
+                    );
+                }
+            }
+
+            state.install_inflight.lock().unwrap().remove(&provider);
+        });
     }
 }
 
@@ -273,6 +351,28 @@ async fn dispatch_request(
                     state.spawn_background_live_discovery(st.provider);
                 }
             }
+            let cached_installs: Vec<(ProviderId, ProviderInstallState)> = {
+                let guard = state.install_states.lock().unwrap();
+                guard
+                    .iter()
+                    .filter(|(_, s)| {
+                        matches!(
+                            s,
+                            ProviderInstallState::Installing { .. }
+                                | ProviderInstallState::Failed { .. }
+                        )
+                    })
+                    .map(|(p, s)| (*p, s.clone()))
+                    .collect()
+            };
+            for (provider, install_state) in cached_installs {
+                let _ = state
+                    .events_tx
+                    .send(DaemonNotification::ProviderInstallUpdated {
+                        provider,
+                        state: install_state,
+                    });
+            }
             Ok(DaemonResponse::Providers(list))
         }
 
@@ -285,6 +385,35 @@ async fn dispatch_request(
                 .events_tx
                 .send(DaemonNotification::ProviderStatusUpdated(st.clone()));
             Ok(DaemonResponse::Provider(st))
+        }
+
+        DaemonRequest::InstallProvider { provider } => {
+            let st = state.probe_provider(provider).await?;
+            if st.installed {
+                state.set_and_broadcast_install_state(provider, ProviderInstallState::Installed);
+                let _ = state
+                    .events_tx
+                    .send(DaemonNotification::ProviderStatusUpdated(st));
+                return Ok(DaemonResponse::InstallStarted {
+                    providers: Vec::new(),
+                });
+            }
+            state.spawn_background_install(provider);
+            Ok(DaemonResponse::InstallStarted {
+                providers: vec![provider],
+            })
+        }
+
+        DaemonRequest::InstallMissingProviders => {
+            let list = state.probe_all_providers().await?;
+            let mut started = Vec::new();
+            for st in list {
+                if !st.installed && st.settings.binary_override.is_none() {
+                    state.spawn_background_install(st.provider);
+                    started.push(st.provider);
+                }
+            }
+            Ok(DaemonResponse::InstallStarted { providers: started })
         }
 
         DaemonRequest::UpdateProviderConfig {
@@ -1603,6 +1732,162 @@ mod tests {
         .await;
         assert!(matches!(resp, DaemonResponse::CompareAdopted { .. }));
 
+        daemon_handle.abort();
+    }
+
+    struct InstallableMockAdapter {
+        provider: ProviderId,
+        installed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for InstallableMockAdapter {
+        fn id(&self) -> ProviderId {
+            self.provider
+        }
+
+        async fn probe_status(
+            &self,
+            settings: &ProviderSettings,
+            _cache: &umisong_providers::ProviderProbeCache,
+        ) -> ProviderStatus {
+            let is_installed = self.installed.load(std::sync::atomic::Ordering::SeqCst);
+            ProviderStatus {
+                provider: self.provider,
+                installed: is_installed,
+                binary_path: is_installed.then(|| "/usr/local/bin/mock".into()),
+                version: is_installed.then(|| "1.0.0".into()),
+                auth: if is_installed {
+                    AuthState::LoggedOut
+                } else {
+                    AuthState::NotInstalled
+                },
+                effective_plan_tier: PlanTier::AutoDetect,
+                models: Vec::new(),
+                active_default_model: settings.default_model.clone(),
+                settings: settings.clone(),
+                notes: None,
+            }
+        }
+
+        fn login_command(
+            &self,
+            _settings: &ProviderSettings,
+            _mode: AuthLoginMode,
+        ) -> Result<CommandSpec> {
+            Ok(CommandSpec {
+                program: "/bin/echo".into(),
+                args: vec!["ok".into()],
+                env: HashMap::new(),
+                cwd: None,
+            })
+        }
+
+        async fn logout(&self, _settings: &ProviderSettings) -> Result<()> {
+            Ok(())
+        }
+
+        async fn install_cli(
+            &self,
+            on_progress: &(dyn Fn(ProviderInstallState) + Send + Sync),
+        ) -> Result<PathBuf> {
+            on_progress(ProviderInstallState::Installing {
+                method: "mock".into(),
+                detail: "Installing mock CLI…".into(),
+            });
+            self.installed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(PathBuf::from("/usr/local/bin/mock"))
+        }
+
+        async fn run_turn(
+            &self,
+            _req: TurnExecutionRequest,
+            _tx: mpsc::UnboundedSender<AgentEvent>,
+            _approval_rx: mpsc::UnboundedReceiver<ApprovalDecision>,
+            _cancel: CancellationToken,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_install_missing_provider_updates_status_over_unix_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = DaemonConfig {
+            socket_path: tmp.path().join("umisongd.sock"),
+            db_path: tmp.path().join("umisong.db"),
+            worktrees_dir: tmp.path().join("worktrees"),
+        };
+
+        let claude_installed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut adapters: HashMap<ProviderId, Arc<dyn ProviderAdapter>> = HashMap::new();
+        adapters.insert(
+            ProviderId::ClaudeCode,
+            Arc::new(InstallableMockAdapter {
+                provider: ProviderId::ClaudeCode,
+                installed: Arc::clone(&claude_installed),
+            }),
+        );
+        adapters.insert(
+            ProviderId::Antigravity,
+            Arc::new(TestMockAdapter(ProviderId::Antigravity)),
+        );
+        adapters.insert(ProviderId::Codex, Arc::new(TestMockAdapter(ProviderId::Codex)));
+        let registry = ProviderRegistry::with_adapters(adapters);
+
+        let state = DaemonState::new_with_registry(cfg, registry).unwrap();
+        let (stream, server_stream) = UnixStream::pair().unwrap();
+        let daemon_handle = tokio::spawn(async move {
+            let _ = handle_client(server_stream, state).await;
+        });
+
+        let (r, mut w) = stream.into_split();
+        let mut lines = BufReader::new(r).lines();
+
+        let (resp, _) = rpc_call(&mut w, &mut lines, 1, DaemonRequest::InstallMissingProviders).await;
+        match resp {
+            DaemonResponse::InstallStarted { providers } => {
+                assert_eq!(providers, vec![ProviderId::ClaudeCode]);
+            }
+            other => panic!("expected InstallStarted, got {other:?}"),
+        }
+
+        let mut saw_installed_notif = false;
+        let mut saw_provider_ready = false;
+        for _ in 0..20 {
+            let line = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                lines.next_line(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            if let ServerMessage::Notification(notif) = serde_json::from_str(&line).unwrap() {
+                match notif {
+                    DaemonNotification::ProviderInstallUpdated { provider, state } => {
+                        if provider == ProviderId::ClaudeCode
+                            && matches!(state, ProviderInstallState::Installed)
+                        {
+                            saw_installed_notif = true;
+                        }
+                    }
+                    DaemonNotification::ProviderStatusUpdated(st) => {
+                        if st.provider == ProviderId::ClaudeCode && st.installed {
+                            saw_provider_ready = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if saw_installed_notif && saw_provider_ready {
+                break;
+            }
+        }
+
+        assert!(saw_installed_notif, "expected ProviderInstallUpdated::Installed");
+        assert!(saw_provider_ready, "expected ProviderStatusUpdated with installed=true");
         daemon_handle.abort();
     }
 }

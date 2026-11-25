@@ -2,7 +2,9 @@ use crate::app::UmisongApp;
 use crate::client::RequestTag;
 use crate::theme::{Palette, hover_factor, lerp_color, paint_status_dot, sakura_cta_button};
 use egui::{CornerRadius, Margin, RichText, Stroke};
-use umisong_core::{AuthLoginMode, AuthState, DaemonRequest, ProviderId};
+use umisong_core::{
+    AuthLoginMode, AuthState, DaemonRequest, ProviderId, ProviderInstallState,
+};
 
 const ACCOUNTS_MAX_WIDTH: f32 = 720.0;
 
@@ -59,6 +61,19 @@ pub fn render_accounts_view(app: &mut UmisongApp, ui: &mut egui::Ui, palette: &P
                 app.settings.dark_theme = !app.settings.dark_theme;
                 app.save_app_settings();
             }
+
+            if ui
+                .checkbox(&mut app.settings.auto_install_clis, "Auto-install CLIs")
+                .on_hover_text(
+                    "Automatically install missing provider CLIs when Umisong Harness opens",
+                )
+                .changed()
+            {
+                app.save_app_settings();
+                if app.settings.auto_install_clis {
+                    app.install_missing_providers();
+                }
+            }
         });
     });
 
@@ -100,6 +115,11 @@ fn render_provider_card(
         .as_ref()
         .is_some_and(|s| matches!(s.auth, AuthState::Authenticated { .. }));
     let is_installed = status.as_ref().is_some_and(|s| s.installed);
+    let install_state = app
+        .provider_install_states
+        .get(&pid)
+        .cloned()
+        .unwrap_or_default();
 
     let card_rect_id = ui.make_persistent_id(("acct_card_rect", pid.as_str()));
     let card_hovered = ui
@@ -191,35 +211,89 @@ fn render_provider_card(
                                                 .color(palette.text_muted),
                                         );
                                     } else {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "{}  ·  not installed",
-                                                pid.cli_binary_name()
-                                            ))
-                                            .monospace()
-                                            .size(11.0)
-                                            .color(palette.danger),
-                                        );
-                                        if ui
-                                            .add(
-                                                egui::Button::new(
-                                                    RichText::new("Copy install cmd")
-                                                        .size(11.0)
+                                        match &install_state {
+                                            ProviderInstallState::Installing { detail, .. } => {
+                                                ui.add(egui::Spinner::new().size(11.0));
+                                                ui.label(
+                                                    RichText::new(detail)
+                                                        .size(11.5)
                                                         .color(palette.accent),
+                                                );
+                                            }
+                                            ProviderInstallState::Failed { message } => {
+                                                let preview: String =
+                                                    message.chars().take(64).collect();
+                                                let suffix = if message.chars().count() > 64 {
+                                                    "…"
+                                                } else {
+                                                    ""
+                                                };
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "Install failed: {preview}{suffix}"
+                                                    ))
+                                                    .size(11.0)
+                                                    .color(palette.danger),
                                                 )
-                                                .frame(false),
-                                            )
-                                            .on_hover_text(pid.install_hint())
-                                            .clicked()
-                                        {
-                                            ui.ctx().copy_text(pid.install_hint().to_string());
-                                            app.toast = Some((
-                                                format!(
-                                                    "Copied install command for {}",
-                                                    pid.display_name()
-                                                ),
-                                                false,
-                                            ));
+                                                .on_hover_text(message);
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new("Copy install cmd")
+                                                                .size(11.0)
+                                                                .color(palette.accent),
+                                                        )
+                                                        .frame(false),
+                                                    )
+                                                    .on_hover_text(pid.install_hint())
+                                                    .clicked()
+                                                {
+                                                    ui.ctx().copy_text(
+                                                        pid.install_hint().to_string(),
+                                                    );
+                                                    app.toast = Some((
+                                                        format!(
+                                                            "Copied install command for {}",
+                                                            pid.display_name()
+                                                        ),
+                                                        false,
+                                                    ));
+                                                }
+                                            }
+                                            _ => {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "{}  ·  not installed",
+                                                        pid.cli_binary_name()
+                                                    ))
+                                                    .monospace()
+                                                    .size(11.0)
+                                                    .color(palette.danger),
+                                                );
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            RichText::new("Copy install cmd")
+                                                                .size(11.0)
+                                                                .color(palette.accent),
+                                                        )
+                                                        .frame(false),
+                                                    )
+                                                    .on_hover_text(pid.install_hint())
+                                                    .clicked()
+                                                {
+                                                    ui.ctx().copy_text(
+                                                        pid.install_hint().to_string(),
+                                                    );
+                                                    app.toast = Some((
+                                                        format!(
+                                                            "Copied install command for {}",
+                                                            pid.display_name()
+                                                        ),
+                                                        false,
+                                                    ));
+                                                }
+                                            }
                                         }
                                     }
                                 } else {
@@ -253,6 +327,49 @@ fn render_provider_card(
                                 RequestTag::RefreshProviders,
                                 DaemonRequest::LogoutProvider { provider: pid },
                             );
+                        }
+                    } else if !is_installed {
+                        match &install_state {
+                            ProviderInstallState::Installing { .. } => {
+                                sakura_cta_button(
+                                    ui,
+                                    ("acct_installing", pid.as_str()),
+                                    "Installing…",
+                                    egui::vec2(94.0, 32.0),
+                                    false,
+                                    palette,
+                                );
+                            }
+                            ProviderInstallState::Failed { .. } => {
+                                if sakura_cta_button(
+                                    ui,
+                                    ("acct_retry_install", pid.as_str()),
+                                    "Retry install",
+                                    egui::vec2(96.0, 32.0),
+                                    true,
+                                    palette,
+                                )
+                                .on_hover_text(pid.install_hint())
+                                .clicked()
+                                {
+                                    app.install_provider_cli(pid);
+                                }
+                            }
+                            _ => {
+                                if sakura_cta_button(
+                                    ui,
+                                    ("acct_install_cli", pid.as_str()),
+                                    "Install CLI",
+                                    egui::vec2(90.0, 32.0),
+                                    true,
+                                    palette,
+                                )
+                                .on_hover_text(pid.install_hint())
+                                .clicked()
+                                {
+                                    app.install_provider_cli(pid);
+                                }
+                            }
                         }
                     } else {
                         if sakura_cta_button(
@@ -295,23 +412,40 @@ fn render_provider_card(
                         }
                     }
 
-                    // Compact Status Pill ("Signed in" / "Signed out" / "Not installed")
+                    // Compact Status Pill ("Signed in" / "Signed out" / "Installing…" / "Install failed" / "Not installed")
                     let (pill_text, pill_bg, pill_fg) = match status.as_ref().map(|s| &s.auth) {
                         Some(AuthState::Authenticated { .. }) => (
                             "Signed in",
                             palette.badge_signed_in_bg,
                             palette.badge_signed_in_fg,
                         ),
-                        Some(AuthState::NotInstalled) => (
-                            "Not installed",
-                            egui::Color32::from_rgba_unmultiplied(
-                                palette.danger.r(),
-                                palette.danger.g(),
-                                palette.danger.b(),
-                                28,
+                        Some(AuthState::NotInstalled) => match &install_state {
+                            ProviderInstallState::Installing { .. } => (
+                                "Installing…",
+                                palette.accent_soft_bg,
+                                palette.accent_soft_fg,
                             ),
-                            palette.danger,
-                        ),
+                            ProviderInstallState::Failed { .. } => (
+                                "Install failed",
+                                egui::Color32::from_rgba_unmultiplied(
+                                    palette.danger.r(),
+                                    palette.danger.g(),
+                                    palette.danger.b(),
+                                    28,
+                                ),
+                                palette.danger,
+                            ),
+                            _ => (
+                                "Not installed",
+                                egui::Color32::from_rgba_unmultiplied(
+                                    palette.danger.r(),
+                                    palette.danger.g(),
+                                    palette.danger.b(),
+                                    28,
+                                ),
+                                palette.danger,
+                            ),
+                        },
                         Some(AuthState::LoggedOut) => (
                             "Signed out",
                             palette.badge_signed_out_bg,

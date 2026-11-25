@@ -35,7 +35,10 @@ pub fn enriched_path() -> String {
     if let Some(home) = dirs::home_dir() {
         for rel in [
             ".local/bin",
+            ".claude/bin",
+            ".codex/bin",
             ".npm-global/bin",
+            ".npm-packages/bin",
             ".pnpm-global/bin",
             ".bun/bin",
             ".cargo/bin",

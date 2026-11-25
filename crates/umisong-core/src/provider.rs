@@ -43,9 +43,9 @@ impl ProviderId {
 
     pub fn install_hint(self) -> &'static str {
         match self {
-            ProviderId::ClaudeCode => "npm install -g @anthropic-ai/claude-code",
-            ProviderId::Antigravity => "Install Antigravity CLI from https://antigravity.google/docs/cli/reference",
-            ProviderId::Codex => "npm install -g @openai/codex",
+            ProviderId::ClaudeCode => "curl -fsSL https://claude.ai/install.sh | bash",
+            ProviderId::Antigravity => "curl -fsSL https://antigravity.google/cli/install.sh | bash",
+            ProviderId::Codex => "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
         }
     }
 
@@ -114,6 +114,21 @@ impl AuthState {
             AuthState::Unknown { .. } => "Check Auth".to_string(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ProviderInstallState {
+    #[default]
+    Idle,
+    Installing {
+        method: String,
+        detail: String,
+    },
+    Installed,
+    Failed {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
