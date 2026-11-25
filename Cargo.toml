@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/umisong-core",
+    "crates/umisong-providers",
+    "crates/umisong-daemon",
+    "crates/umisong-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6.0"
+eframe = "0.31"
+egui = "0.31"
+open = "5.3"
+png = "0.18"
+portable-pty = "0.9"
+rfd = "0.15"
+rusqlite = { version = "0.34", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.19"
+tokio = { version = "1.44", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.16", features = ["v4", "serde"] }
+vt100 = "0.15"
+
+umisong-core = { path = "crates/umisong-core" }
+umisong-providers = { path = "crates/umisong-providers" }
+umisong-daemon = { path = "crates/umisong-daemon" }
+
+# Keep workspace incremental builds fast while running egui/epaint/ab_glyph at native 60-120fps speed.
+[profile.dev.package."*"]
+opt-level = 2
